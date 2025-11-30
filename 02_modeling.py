@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score, make_scorer
+from sklearn.metrics import roc_auc_score, make_scorer, average_precision_score, f1_score, confusion_matrix, classification_report
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -166,9 +166,123 @@ for idx, row in results_summary.iterrows():
 print("\n" + "=" * 60)
 print("Step 2.3 Complete: Ready to train final model")
 print("=" * 60)
-print(f"\nRecommended parameters for final model:")
-print(f"  n_estimators: 500")
-print(f"  max_features: {grid_search.best_params_['max_features']}")
-print(f"  min_samples_leaf: {grid_search.best_params_['min_samples_leaf']}")
-print(f"  class_weight: 'balanced'")
-print(f"\nExpected CV ROC-AUC: {grid_search.best_score_:.4f}")
+
+# =============================================================================
+# Step 2.4: Train Final Model
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Step 2.4: Train Final Model")
+print("=" * 60)
+
+# Best parameters from CV
+best_params = {
+    'n_estimators': 500,
+    'max_features': grid_search.best_params_['max_features'],
+    'min_samples_leaf': grid_search.best_params_['min_samples_leaf'],
+    'class_weight': 'balanced',
+    'random_state': 42,
+    'n_jobs': -1
+}
+
+print(f"\nFinal model parameters:")
+for k, v in best_params.items():
+    print(f"  {k}: {v}")
+
+# Train final model on full training set
+print(f"\nTraining final model on {len(X_train):,} observations...")
+final_model = RandomForestClassifier(**best_params)
+final_model.fit(X_train, y_train, sample_weight=weights_train)
+
+print(f"Model trained successfully.")
+print(f"  Number of trees: {final_model.n_estimators}")
+print(f"  Number of features: {final_model.n_features_in_}")
+
+# =============================================================================
+# Step 2.5: Evaluate on Test Set
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Step 2.5: Evaluate on Test Set")
+print("=" * 60)
+
+# Get predictions
+y_train_pred_proba = final_model.predict_proba(X_train)[:, 1]
+y_test_pred_proba = final_model.predict_proba(X_test)[:, 1]
+y_test_pred = final_model.predict(X_test)
+
+# Calculate metrics
+train_roc_auc = roc_auc_score(y_train, y_train_pred_proba, sample_weight=weights_train)
+test_roc_auc = roc_auc_score(y_test, y_test_pred_proba, sample_weight=weights_test)
+test_pr_auc = average_precision_score(y_test, y_test_pred_proba, sample_weight=weights_test)
+test_f1 = f1_score(y_test, y_test_pred)
+
+# Confusion matrix at threshold=0.5
+cm = confusion_matrix(y_test, y_test_pred)
+tn, fp, fn, tp = cm.ravel()
+
+print(f"\n" + "-" * 60)
+print("PRIMARY METRICS")
+print("-" * 60)
+
+# ROC-AUC
+roc_target = 0.75
+roc_status = "✓ PASS" if test_roc_auc >= roc_target else "✗ FAIL"
+print(f"\nROC-AUC (target ≥{roc_target}):")
+print(f"  Test ROC-AUC: {test_roc_auc:.4f} {roc_status}")
+
+# PR-AUC
+pr_target = 0.45
+pr_status = "✓ PASS" if test_pr_auc >= pr_target else "✗ FAIL"
+print(f"\nPR-AUC (target ≥{pr_target}):")
+print(f"  Test PR-AUC: {test_pr_auc:.4f} {pr_status}")
+
+# F1 Score
+print(f"\nF1 Score:")
+print(f"  Test F1: {test_f1:.4f}")
+
+print(f"\n" + "-" * 60)
+print("CONFUSION MATRIX (threshold=0.5)")
+print("-" * 60)
+print(f"\n                 Predicted")
+print(f"                 Non-Trump  Trump")
+print(f"Actual Non-Trump    {tn:4d}    {fp:4d}")
+print(f"Actual Trump        {fn:4d}    {tp:4d}")
+
+# Additional metrics from confusion matrix
+accuracy = (tp + tn) / (tp + tn + fp + fn)
+precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+print(f"\nDerived metrics:")
+print(f"  Accuracy: {accuracy:.4f}")
+print(f"  Precision (Trump): {precision:.4f}")
+print(f"  Recall (Trump): {recall:.4f}")
+print(f"  Specificity (Non-Trump): {specificity:.4f}")
+
+print(f"\n" + "-" * 60)
+print("OVERFITTING CHECK (Train vs Test)")
+print("-" * 60)
+auc_gap = train_roc_auc - test_roc_auc
+print(f"\n  Train ROC-AUC: {train_roc_auc:.4f}")
+print(f"  Test ROC-AUC:  {test_roc_auc:.4f}")
+print(f"  Gap:           {auc_gap:.4f}")
+
+if auc_gap > 0.10:
+    print(f"\n  ⚠ WARNING: Train-Test gap > 0.10 suggests overfitting")
+elif auc_gap > 0.05:
+    print(f"\n  ⚠ CAUTION: Train-Test gap > 0.05, moderate overfitting")
+else:
+    print(f"\n  ✓ Gap < 0.05, minimal overfitting")
+
+print(f"\n" + "=" * 60)
+print("Step 2.5 Complete: Model Evaluation Summary")
+print("=" * 60)
+
+print(f"\n{'Metric':<20} {'Value':<10} {'Target':<10} {'Status':<10}")
+print("-" * 50)
+print(f"{'ROC-AUC':<20} {test_roc_auc:<10.4f} {'≥0.75':<10} {roc_status:<10}")
+print(f"{'PR-AUC':<20} {test_pr_auc:<10.4f} {'≥0.45':<10} {pr_status:<10}")
+print(f"{'F1 Score':<20} {test_f1:<10.4f} {'-':<10} {'-':<10}")
+print(f"{'Train-Test Gap':<20} {auc_gap:<10.4f} {'<0.10':<10} {'✓' if auc_gap < 0.10 else '✗':<10}")

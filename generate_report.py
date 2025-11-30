@@ -98,8 +98,8 @@ def main():
             '## Sample Characteristics',
             '',
             'Total Latino Voters:          3,001',
-            'Trump Voters (DV=1):          539 (18.0%)',
-            'Non-Trump Voters (DV=0):      2,462 (82.0%)',
+            'Trump Voters (DV=1):          594 (19.8%)',
+            'Non-Trump Voters (DV=0):      2,407 (80.2%)',
             'Features (one-hot encoded):   1,517',
             'Train/Test Split:             80/20 stratified',
             '',
@@ -108,24 +108,24 @@ def main():
             '**Full Model (all 1,517 features)',
             '  Test ROC-AUC:               0.9383',
             '',
-            '**Non-Partisan Model (1,471 features)',
-            '  Test ROC-AUC:               0.8736',
-            '  AUC Drop:                   0.0647 (6.9% relative)',
+            '**Non-Partisan Model (1,444 features)',
+            '  Test ROC-AUC:               0.8793',
+            '  AUC Drop:                   0.0590 (6.3% relative)',
             '',
-            'Note: Non-partisan model excludes 46 variables measuring',
-            'party ID, ideology, and candidate favorability ratings.',
+            'Note: Non-partisan model excludes 73 variables measuring',
+            'party ID, ideology, candidate favorability, and party evals.',
             '',
             '## Key Findings',
             '',
             '1. Trump favorability is strongest single predictor',
             '2. Party ID and partisan leanings dominate full model',
-            '3. Removing partisan vars reduces AUC by only 6.9%',
+            '3. Removing partisan vars reduces AUC by only 6.3%',
             '4. Non-partisan model reveals immigration attitudes:',
             '   - Views on immigration levels (increase/decrease)',
             '   - Citizenship pathway for undocumented',
             '   - Attitudes toward hearing Spanish spoken',
             '   - Support for deportation policies',
-            '5. Strong predictive power (AUC 0.87) without partisan vars',
+            '5. Strong predictive power (AUC 0.88) without partisan vars',
         ]
 
         create_text_page(pdf,
@@ -136,7 +136,7 @@ def main():
         # PAGE 2-3: Full Model Top 30 Predictors (split across 2 pages)
         # =================================================================
         try:
-            df_full = pd.read_csv('top30_full_model.csv')
+            df_full = pd.read_csv('top30_full_model_corrected.csv')
             df_full_display = df_full[['feature', 'importance_mean', 'importance_std']].head(30)
             df_full_display.columns = ['Feature', 'Importance', 'Std']
 
@@ -159,19 +159,19 @@ def main():
         # PAGE 4-5: Non-Partisan Model Top 30 Predictors (split across 2 pages)
         # =================================================================
         try:
-            df_np = pd.read_csv('top30_nonpartisan_model.csv')
+            df_np = pd.read_csv('top30_nonpartisan_model_corrected.csv')
             df_np_display = df_np[['feature', 'importance_mean', 'importance_std']].head(30)
             df_np_display.columns = ['Feature', 'Importance', 'Std']
 
             # Page 4: Ranks 1-15
             create_table_page(pdf,
-                'Top 30 Predictors - Non-Partisan Model (AUC: 0.8736)\nRanks 1-15',
+                'Top 30 Predictors - Non-Partisan Model (AUC: 0.8793)\nRanks 1-15',
                 df_np_display.iloc[0:15].copy(),
                 start_rank=1)
 
             # Page 5: Ranks 16-30
             create_table_page(pdf,
-                'Top 30 Predictors - Non-Partisan Model (AUC: 0.8736)\nRanks 16-30',
+                'Top 30 Predictors - Non-Partisan Model (AUC: 0.8793)\nRanks 16-30',
                 df_np_display.iloc[15:30].copy(),
                 start_rank=16)
 
@@ -182,34 +182,35 @@ def main():
         # PAGE 6: Partisan Variables Removed
         # =================================================================
         page6_content = [
-            '## Partisan Variables Removed (46 columns total)',
+            '## Partisan Variables Removed (73 columns total)',
             '',
             'Variable    Description',
             '----------- ------------------------------------------',
-            'C25         Party registration',
-            'C26         Strong partisan identification',
-            'C31         Ideology (liberal-conservative scale)',
-            'L46         Which party better on immigration',
-            'L266        Which party better for Latinos',
-            'L267        Which party better on values',
             'C2          Hillary Clinton favorability',
             'C3          Bernie Sanders favorability',
             'C4          Donald Trump favorability',
             'C5          Ted Cruz favorability',
             'C8          Bill Clinton favorability',
             'C9          Barack Obama favorability',
+            'C10         Michelle Obama favorability',
+            'C11         Jeb Bush favorability',
+            'C25         Party registration (Rep/Dem/Ind)',
+            'C26         Strong partisan identification',
+            'C27         Party lean (for independents)',
+            'C31         Ideology (liberal-conservative scale)',
+            'L46         Which party better on immigration',
+            'L266        Which party better for Latinos',
+            'L267        Which party better on values',
+            'L293        Democratic Party favorability (0-10)',
+            'L294        Republican Party favorability (0-10)',
             'C242_HID    Party identification (derived)',
-            '',
+            'LA204       Party support (group support)',
             '',
             '## Interpretation Notes',
             '',
             'Permutation Importance: Measures feature importance by',
             'shuffling each feature and measuring AUC decrease.',
             '(50 repeats for stability)',
-            '',
-            'SHAP Values: Measures average contribution of each',
-            'feature to individual predictions.',
-            '(Computed on 500 test observations)',
             '',
             '',
             f'Report generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}',

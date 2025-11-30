@@ -84,9 +84,14 @@ drop_race_specific <- drop_race_specific[sapply(latinos_voters[, drop_race_speci
                                                  function(x) sum(is.na(x)) / length(x) > 0.95)]
 cat("Dropping race-specific (>95% NA):", length(drop_race_specific), "\n")
 
+# 3f. Tautological variables (candidate favorability/vote items too close to DV)
+# C6 = Trump favorability, C7 = Clinton favorability, C15 = Congressional vote
+drop_tautological <- c("C6", "C7", "C15")
+cat("Dropping tautological (candidate fav/vote):", length(drop_tautological), "\n")
+
 # Combine all drops
 drop_all <- unique(c(drop_identifiers, drop_high_missing, drop_open_text,
-                     drop_splits, drop_race_specific))
+                     drop_splits, drop_race_specific, drop_tautological))
 cat("\nTotal variables to drop:", length(drop_all), "\n")
 
 # Apply drops

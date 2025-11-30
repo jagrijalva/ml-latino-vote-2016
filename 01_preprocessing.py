@@ -359,30 +359,228 @@ if 'trump_vote' in df_clean.columns:
 else:
     print(f"\nWARNING: DV 'trump_vote' was excluded!")
 
-# Save the cleaned dataset
-print("\n" + "-" * 60)
-print("Saving preprocessed data...")
-print("-" * 60)
-df_clean.to_csv('cmps_2016_clean.csv', index=False)
-print(f"Saved: cmps_2016_clean.csv ({len(df_clean):,} rows, {len(df_clean.columns):,} columns)")
-
-# Also save the exclusion log
+# Save the exclusion log
 exclusion_log = pd.DataFrame([
     {'category': cat, 'variable': var}
     for cat, vars_list in exclude_vars.items()
     for var in vars_list if var in df_voters.columns
 ])
-exclusion_log.to_csv('excluded_variables.csv', index=False)
-print(f"Saved: excluded_variables.csv ({len(exclusion_log):,} exclusions logged)")
+exclusion_log.to_csv('cmps_2016_excluded_vars.csv', index=False)
+print(f"\nSaved: cmps_2016_excluded_vars.csv ({len(exclusion_log):,} exclusions logged)")
+
+# =============================================================================
+# Step 1.6: Pool Rare Factor Levels
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Step 1.6: Pool Rare Factor Levels (<5% -> Other)")
+print("=" * 60)
+
+# Separate DV from predictors for processing
+y = df_clean['trump_vote'].copy()
+X = df_clean.drop(columns=['trump_vote'])
+
+# Track which variables were affected
+pooled_vars = []
+pooling_details = []
+
+for col in X.columns:
+    if X[col].dtype == 'object':
+        # Calculate frequency of each level
+        value_counts = X[col].value_counts(normalize=True, dropna=False)
+        rare_levels = value_counts[value_counts < 0.05].index.tolist()
+
+        # Remove NaN from rare_levels if present (handled separately)
+        rare_levels = [lvl for lvl in rare_levels if pd.notna(lvl)]
+
+        if len(rare_levels) > 0:
+            n_rare = len(rare_levels)
+            n_affected = X[col].isin(rare_levels).sum()
+
+            # Recode rare levels to "Other"
+            X[col] = X[col].apply(lambda x: 'Other' if x in rare_levels else x)
+
+            pooled_vars.append(col)
+            pooling_details.append({
+                'variable': col,
+                'n_rare_levels': n_rare,
+                'n_obs_affected': n_affected,
+                'pct_affected': n_affected / len(X) * 100
+            })
+
+print(f"\nVariables with pooled rare levels: {len(pooled_vars)}")
+if len(pooled_vars) > 0:
+    pooling_df = pd.DataFrame(pooling_details)
+    print(f"\nTop 10 most affected variables:")
+    print(pooling_df.nlargest(10, 'n_obs_affected')[['variable', 'n_rare_levels', 'pct_affected']].to_string(index=False))
+
+    # Save pooling details
+    pooling_df.to_csv('cmps_2016_pooling_log.csv', index=False)
+    print(f"\nSaved: cmps_2016_pooling_log.csv")
+
+# =============================================================================
+# Step 1.7: Impute Remaining Missing Values
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Step 1.7: Impute Remaining Missing Values")
+print("=" * 60)
+
+# Check missing before imputation
+missing_before = X.isna().sum()
+cols_with_missing = missing_before[missing_before > 0]
+print(f"\nColumns with missing values before imputation: {len(cols_with_missing)}")
+print(f"Total missing cells: {missing_before.sum():,}")
+
+# Separate numeric and categorical columns
+numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+categorical_cols = X.select_dtypes(include=['object']).columns.tolist()
+
+print(f"\nNumeric columns: {len(numeric_cols)}")
+print(f"Categorical columns: {len(categorical_cols)}")
+
+# Impute numeric with median
+imputation_log = []
+for col in numeric_cols:
+    n_missing = X[col].isna().sum()
+    if n_missing > 0:
+        median_val = X[col].median()
+        X[col] = X[col].fillna(median_val)
+        imputation_log.append({
+            'variable': col,
+            'type': 'numeric',
+            'method': 'median',
+            'imputed_value': median_val,
+            'n_imputed': n_missing
+        })
+
+# Impute categorical with mode
+for col in categorical_cols:
+    n_missing = X[col].isna().sum()
+    if n_missing > 0:
+        mode_val = X[col].mode()
+        if len(mode_val) > 0:
+            mode_val = mode_val[0]
+        else:
+            mode_val = 'Unknown'
+        X[col] = X[col].fillna(mode_val)
+        imputation_log.append({
+            'variable': col,
+            'type': 'categorical',
+            'method': 'mode',
+            'imputed_value': mode_val,
+            'n_imputed': n_missing
+        })
+
+# Verify zero missing
+missing_after = X.isna().sum().sum()
+print(f"\n" + "-" * 60)
+print("IMPUTATION SUMMARY")
+print("-" * 60)
+print(f"Variables imputed: {len(imputation_log)}")
+print(f"Missing values remaining: {missing_after}")
+
+if len(imputation_log) > 0:
+    imputation_df = pd.DataFrame(imputation_log)
+    print(f"\nImputation by type:")
+    print(imputation_df.groupby('type')['n_imputed'].agg(['count', 'sum']))
+
+    # Save imputation log
+    imputation_df.to_csv('cmps_2016_imputation_log.csv', index=False)
+    print(f"\nSaved: cmps_2016_imputation_log.csv")
+
+if missing_after > 0:
+    print(f"\nWARNING: {missing_after} missing values remain!")
+else:
+    print(f"\nConfirmed: Zero missing values after imputation")
+
+# =============================================================================
+# Step 1.8: One-Hot Encode Categorical Variables
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Step 1.8: One-Hot Encode Categorical Variables")
+print("=" * 60)
+
+n_features_before = len(X.columns)
+n_categorical = len(categorical_cols)
+
+print(f"\nFeatures before encoding: {n_features_before}")
+print(f"Categorical columns to encode: {n_categorical}")
+
+# One-hot encode with drop_first=True to avoid multicollinearity
+X_encoded = pd.get_dummies(X, drop_first=True)
+
+# Convert boolean columns to int (0/1)
+bool_cols = X_encoded.select_dtypes(include=['bool']).columns
+X_encoded[bool_cols] = X_encoded[bool_cols].astype(int)
+
+n_features_after = len(X_encoded.columns)
+
+print(f"\n" + "-" * 60)
+print("ENCODING SUMMARY")
+print("-" * 60)
+print(f"Features before encoding: {n_features_before}")
+print(f"Features after encoding: {n_features_after}")
+print(f"New dummy features created: {n_features_after - n_features_before + n_categorical}")
+
+# Verify all columns are numeric
+non_numeric = X_encoded.select_dtypes(exclude=[np.number]).columns.tolist()
+if len(non_numeric) > 0:
+    print(f"\nWARNING: {len(non_numeric)} non-numeric columns remain!")
+else:
+    print(f"\nConfirmed: All {n_features_after} features are numeric")
+
+# =============================================================================
+# Step 1.9: Save Final Outputs
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Step 1.9: Save Final Outputs")
+print("=" * 60)
+
+# Convert y to integer
+y = y.astype(int)
+
+# Create weights dataframe
+weights = pd.DataFrame({'survey_wt': survey_wt.values})
+
+# Save as parquet files
+X_encoded.to_parquet('cmps_2016_X.parquet', index=False)
+y.to_frame('trump_vote').to_parquet('cmps_2016_y.parquet', index=False)
+weights.to_parquet('cmps_2016_weights.parquet', index=False)
+
+print(f"\nSaved output files:")
+print(f"  - cmps_2016_X.parquet: {X_encoded.shape[0]:,} rows x {X_encoded.shape[1]:,} features")
+print(f"  - cmps_2016_y.parquet: {len(y):,} labels")
+print(f"  - cmps_2016_weights.parquet: {len(weights):,} weights")
+
+# Also save feature names for reference
+feature_names = pd.DataFrame({'feature': X_encoded.columns})
+feature_names.to_csv('cmps_2016_feature_names.csv', index=False)
+print(f"  - cmps_2016_feature_names.csv: {len(feature_names):,} feature names")
+
+# =============================================================================
+# PHASE 1 COMPLETE
+# =============================================================================
 
 print("\n" + "=" * 60)
 print("PHASE 1 COMPLETE: Data Preprocessing")
 print("=" * 60)
-print(f"\nSummary:")
-print(f"  - Loaded CMPS 2016 data: {df.shape[0]:,} observations, {df.shape[1]:,} variables")
-print(f"  - Created DV: trump_vote (1=Trump, 0=Non-Trump)")
-print(f"  - Filtered to voters only: {len(df_voters):,} observations")
-print(f"  - Preserved survey weights: survey_weights.csv")
-print(f"  - Excluded {len(all_exclude):,} inappropriate variables")
-print(f"  - Final dataset: {len(df_clean):,} obs x {len(df_clean.columns):,} vars")
-print(f"  - Saved to: cmps_2016_clean.csv")
+print(f"\nPipeline Summary:")
+print(f"  Step 1.1: Loaded CMPS 2016 data (10,144 obs)")
+print(f"  Step 1.1b: Filtered to Latinos ({n_after:,} obs)")
+print(f"  Step 1.2: Created DV: trump_vote")
+print(f"  Step 1.2b: Filtered to voters ({len(y):,} obs)")
+print(f"  Step 1.3: Preserved survey weights")
+print(f"  Step 1.4: Excluded {len(all_exclude):,} inappropriate variables")
+print(f"  Step 1.6: Pooled rare factor levels ({len(pooled_vars)} vars)")
+print(f"  Step 1.7: Imputed {len(imputation_log)} variables")
+print(f"  Step 1.8: One-hot encoded → {n_features_after:,} features")
+print(f"  Step 1.9: Saved parquet outputs")
+
+print(f"\nFinal Dataset:")
+print(f"  - Observations: {len(y):,}")
+print(f"  - Features: {n_features_after:,}")
+print(f"  - Trump voters: {y.sum():,} ({y.mean()*100:.1f}%)")
+print(f"  - Non-Trump voters: {len(y) - y.sum():,} ({(1-y.mean())*100:.1f}%)")

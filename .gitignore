@@ -50,6 +50,7 @@ rsconnect/
 data/*.rda
 data/*.csv
 *.csv
+*.parquet
 .DS_Store
 __pycache__/
 *.pyc

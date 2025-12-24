@@ -1,0 +1,104 @@
+---
+title: "Phase 1B: One-Hot Encoding"
+format: html
+---
+
+```{r}
+library(tidyverse)
+
+# Load cleaned data from Phase 1A
+model1_data <- readRDS("data/processed/model1_data_clean.rds")
+model2_data <- readRDS("data/processed/model2_data_clean.rds")
+
+cat("Model 1:", nrow(model1_data), "obs,", ncol(model1_data), "vars\n")
+cat("Model 2:", nrow(model2_data), "obs,", ncol(model2_data), "vars\n")
+```
+
+```{r}
+# Verify data is clean
+cat("Model 1 column types:\n")
+types <- sapply(model1_data, function(x) class(x)[1])
+print(table(types))
+
+cat("\nAny NAs:", sum(is.na(model1_data)), "\n")
+cat("Any lists:", any(sapply(model1_data, is.list)), "\n")
+```
+
+```{r}
+# One-hot encode function
+encode_onehot <- function(df) {
+  # Save DV
+  y <- df$trump_vote
+  n <- nrow(df)
+  
+  # Get column info
+  cols_to_encode <- c()
+  cols_numeric <- c()
+  
+  for (col_name in names(df)) {
+    if (col_name == "trump_vote") next
+    
+    col <- df[[col_name]]
+    if (is.numeric(col)) {
+      cols_numeric <- c(cols_numeric, col_name)
+    } else if (is.character(col) || is.factor(col)) {
+      cols_to_encode <- c(cols_to_encode, col_name)
+    }
+  }
+  
+  cat("Numeric columns:", length(cols_numeric), "\n")
+  cat("Columns to encode:", length(cols_to_encode), "\n")
+  
+  # Start result with numeric columns
+  result <- as.data.frame(df[, cols_numeric, drop = FALSE])
+  
+  # One-hot encode each character column
+  for (col_name in cols_to_encode) {
+    col <- as.character(df[[col_name]])
+    levels <- unique(col)
+    levels <- levels[!is.na(levels)]
+    
+    if (length(levels) >= 2) {
+      # Skip first level as reference
+      for (lvl in levels[-1]) {
+        new_name <- paste0(col_name, "_", make.names(lvl))
+        result[[new_name]] <- as.integer(col == lvl)
+      }
+    }
+  }
+  
+  # Add DV back
+  result$trump_vote <- y
+  
+  return(result)
+}
+```
+
+```{r}
+# Encode Model 1
+cat("Encoding Model 1...\n")
+model1_encoded <- encode_onehot(model1_data)
+cat("Model 1 encoded:", ncol(model1_encoded) - 1, "features\n\n")
+```
+
+```{r}
+# Encode Model 2
+cat("Encoding Model 2...\n")
+model2_encoded <- encode_onehot(model2_data)
+cat("Model 2 encoded:", ncol(model2_encoded) - 1, "features\n")
+```
+
+```{r}
+# Save encoded data
+saveRDS(model1_encoded, "data/processed/model1_encoded.rds")
+saveRDS(model2_encoded, "data/processed/model2_encoded.rds")
+
+cat("\nEncoded data saved\n")
+```
+
+```{r}
+cat("\n=== PHASE 1B COMPLETE ===\n")
+cat("Model 1:", ncol(model1_encoded) - 1, "features\n")
+cat("Model 2:", ncol(model2_encoded) - 1, "features\n")
+cat("Difference:", ncol(model1_encoded) - ncol(model2_encoded), "\n")
+```

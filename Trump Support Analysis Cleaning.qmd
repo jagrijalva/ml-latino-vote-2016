@@ -1,0 +1,187 @@
+---
+title: "Phase 1A: Data Cleaning"
+format: html
+---
+
+```{r}
+library(tidyverse)
+
+# Load
+load("/Users/jessalagrijalva/Desktop/Machine Learning/-latino-trump-support-ml/data/CMPS_2016_raw.rda")
+cmps_raw <- da38040.0001
+
+cat("Raw:", nrow(cmps_raw), "obs,", ncol(cmps_raw), "vars\n")
+```
+
+```{r}
+# Filter Latino + Create DV
+cmps <- cmps_raw %>% 
+  filter(ETHNIC_QUOTA == "Latino") %>%
+  filter(!is.na(C14)) %>%
+  mutate(
+    trump_vote = case_when(
+      str_detect(toupper(as.character(C14)), "DONALD TRUMP") ~ 1L,
+      str_detect(toupper(as.character(C14)), "HILLARY CLINTON|GARY JOHNSON|JILL STEIN|SOMEONE ELSE") ~ 0L
+    )
+  ) %>%
+  filter(!is.na(trump_vote))
+
+cat("Latino sample:", nrow(cmps), "\n")
+cat("Trump:", sum(cmps$trump_vote), "(", round(mean(cmps$trump_vote)*100, 1), "%)\n")
+```
+
+```{r}
+# Define exclusions
+admin_vars <- c("RESPID", "ZIPCODE", "CITY_NAME", "COUNTY_NAME", "INTERVIEW_START", 
+                "INTERVIEW_END", "DIFF_DATE", "ETHNIC_QUOTA", "WEIGHT", "NAT_WEIGHT")
+tautological <- c("C14", "C6", "C7", "C15")
+trump_vars <- names(cmps)[grepl("^C4_|^C4$", names(cmps))]
+
+miss_pct <- colMeans(is.na(cmps)) * 100
+high_miss <- names(miss_pct[miss_pct > 50])
+
+tier1 <- unique(c(admin_vars, tautological, trump_vars, high_miss))
+tier1 <- tier1[tier1 %in% names(cmps)]
+
+tier2 <- names(cmps)[grepl("^C2_|^C3_|^C5_|^C8_|^C9_|^C10_|^C11_|^C25_|^C26_|^C27_|^C31_|^C242|^L46_|^L266_|^L267_|^L293|^L294|^LA203_|^LA204_", names(cmps))]
+
+cat("Tier 1 (all models):", length(tier1), "\n")
+cat("Tier 2 (partisan):", length(tier2), "\n")
+```
+
+```{r}
+# Apply Tier 1 exclusions
+cmps_clean <- cmps[, !(names(cmps) %in% tier1)]
+
+# Remove list columns
+list_cols <- names(cmps_clean)[sapply(seq_along(cmps_clean), function(i) is.list(cmps_clean[[i]]))]
+if (length(list_cols) > 0) {
+  cat("Removing list columns:", length(list_cols), "\n")
+  cmps_clean <- cmps_clean[, !(names(cmps_clean) %in% list_cols)]
+}
+
+# Convert all factors to character
+for (i in seq_along(cmps_clean)) {
+  if (is.factor(cmps_clean[[i]])) {
+    cmps_clean[[i]] <- as.character(cmps_clean[[i]])
+  }
+}
+
+cat("After Tier 1:", ncol(cmps_clean), "vars\n")
+```
+
+```{r}
+# Check column types
+col_types <- sapply(seq_along(cmps_clean), function(i) class(cmps_clean[[i]])[1])
+names(col_types) <- names(cmps_clean)
+
+cat("\nColumn types:\n")
+print(table(col_types))
+```
+
+```{r}
+# Impute missing values
+for (i in seq_along(cmps_clean)) {
+  col <- cmps_clean[[i]]
+  col_name <- names(cmps_clean)[i]
+  
+  if (col_name == "trump_vote") next
+  
+  if (any(is.na(col))) {
+    if (is.numeric(col)) {
+      cmps_clean[[i]][is.na(col)] <- median(col, na.rm = TRUE)
+    } else if (is.character(col)) {
+      tbl <- table(col)
+      if (length(tbl) > 0) {
+        mode_val <- names(sort(tbl, decreasing = TRUE))[1]
+        cmps_clean[[i]][is.na(col)] <- mode_val
+      }
+    }
+  }
+}
+
+cat("Imputation complete\n")
+cat("Remaining NAs:", sum(is.na(cmps_clean)), "\n")
+```
+
+```{r}
+# Pool rare levels in character columns
+char_cols <- names(cmps_clean)[sapply(seq_along(cmps_clean), function(i) is.character(cmps_clean[[i]]))]
+
+for (col_name in char_cols) {
+  x <- cmps_clean[[col_name]]
+  freq <- prop.table(table(x))
+  rare <- names(freq[freq < 0.05])
+  if (length(rare) > 0) {
+    cmps_clean[[col_name]][x %in% rare] <- "Other"
+  }
+}
+
+cat("Rare level pooling complete\n")
+```
+
+```{r}
+# Remove single-level columns
+to_remove <- c()
+for (i in seq_along(cmps_clean)) {
+  col_name <- names(cmps_clean)[i]
+  if (col_name == "trump_vote") next
+  if (length(unique(cmps_clean[[i]])) < 2) {
+    to_remove <- c(to_remove, col_name)
+  }
+}
+
+if (length(to_remove) > 0) {
+  cat("Removing", length(to_remove), "single-level columns\n")
+  cmps_clean <- cmps_clean[, !(names(cmps_clean) %in% to_remove)]
+}
+
+cat("Final vars:", ncol(cmps_clean), "\n")
+```
+
+```{r}
+# Create Model 1 and Model 2 datasets
+tier2_in_data <- tier2[tier2 %in% names(cmps_clean)]
+
+model1_data <- cmps_clean
+model2_data <- cmps_clean[, !(names(cmps_clean) %in% tier2_in_data)]
+
+cat("Model 1:", ncol(model1_data), "vars\n")
+cat("Model 2:", ncol(model2_data), "vars\n")
+cat("Tier 2 removed:", length(tier2_in_data), "\n")
+```
+
+```{r}
+# Final check - column types in model1_data
+cat("\nModel 1 column types:\n")
+types1 <- sapply(seq_along(model1_data), function(i) class(model1_data[[i]])[1])
+print(table(types1))
+
+# Any lists remaining?
+any_list <- any(sapply(seq_along(model1_data), function(i) is.list(model1_data[[i]])))
+cat("\nAny list columns:", any_list, "\n")
+```
+
+```{r}
+# Save cleaned data (before encoding)
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/logs", recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(model1_data, "data/processed/model1_data_clean.rds")
+saveRDS(model2_data, "data/processed/model2_data_clean.rds")
+saveRDS(tier2_in_data, "data/processed/tier2_partisan_vars.rds")
+
+write_csv(data.frame(variable = tier1), "outputs/logs/tier1_exclusions.csv")
+write_csv(data.frame(variable = tier2_in_data), "outputs/logs/tier2_partisan_vars.csv")
+
+cat("Clean data saved (before encoding)\n")
+```
+
+```{r}
+cat("\n=== PHASE 1A COMPLETE ===\n")
+cat("Sample:", nrow(model1_data), "\n")
+cat("Trump:", sum(model1_data$trump_vote), "(", round(mean(model1_data$trump_vote)*100,1), "%)\n")
+cat("Model 1 vars:", ncol(model1_data), "\n")
+cat("Model 2 vars:", ncol(model2_data), "\n")
+cat("\nNext: Run Phase 1B for encoding\n")
+```

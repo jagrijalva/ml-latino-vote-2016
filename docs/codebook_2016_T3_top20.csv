@@ -1,0 +1,21 @@
+rank,feature,orig_question_short,scale_low_pole,scale_high_pole,pipeline_recoded,pipeline_high_means,direction_aware_label,needs_viz_flip,notes
+1,C228,BLM movement support,Strongly support,Strongly oppose,yes,Strongly oppose,Oppose BLM,no,
+2,C45,"Obamacare: amend, not repeal",Strongly agree,Strongly disagree,yes,Strongly disagree (repeal),Repeal Obamacare,no,
+3,C142,Reaction to immigrant-rights flag displays,Strongly support,Bothers me a lot,yes,Bothers me a lot,Bothered by immigrant-rights flag displays,no,
+4,C141,Pathway to citizenship vs deport,Strongly support pathway,Somewhat support deport,yes,Strongly support deport,Support deportation over citizenship,no,
+5,BLA207,Immigrants take jobs/housing/healthcare,Strongly agree,Strongly disagree,yes,Agree immigrants take jobs/housing/healthcare,Immigrants take jobs/housing/healthcare,no,scale artifact (spec max=5 on 4-point item) but rank preserved
+6,C38,Undocumented immigrant policy,Stay & apply for citizenship,Required to leave,yes,Required to leave,Support deportation of undocumented,no,scale artifact (spec max=4 on 3-point item) but rank preserved
+7,L366,Worry about detention/deportation,Extremely worried,Not at all worried,yes,Not at all worried,Not worried about detention/deportation,no,scale artifact (spec max=4 on 5-point item) but rank preserved
+8,C158,Federal apology for slavery,Should,Should not,no,Should not apologize,Oppose federal apology for slavery,no,
+9,C41,Immigration hurts state economy,Strongly agree,Strongly disagree,yes,Strongly agree,Immigration hurts the economy,no,
+10,L241,LGB rights activism,Strongly support,Strongly oppose,yes,Strongly oppose,Oppose LGB rights activism,no,scale artifact (spec max=4 on 5-point item) but rank preserved
+11,BLA205,Immigrants who break law should leave,Strongly agree,Strongly disagree,no,Strongly disagree,Support removing lawbreaking immigrants,yes,conservative pole is low; flip axis at viz
+12,BL174,People like me more likely to be arrested,Strongly agree,Strongly disagree,no,Strongly disagree (deny personal arrest risk),Deny personal arrest risk,no,revisit coding direction if reviewer challenges
+13,LA250,Discrimination against own national-origin subgroup,A lot,None at all (DK=NA),no,None at all,Perceive no discrimination against own subgroup,no,
+14,L268,Seriousness of Latino discrimination,Primary problem,Not a problem at all,no,Not a problem at all,Minimize Latino discrimination,no,
+15,BL229,BLM effectiveness,Very effective,Not at all effective,no,Not at all effective,Dismiss BLM effectiveness,no,
+16,L231,Local police treat Latinos fairly vs unfairly,Often treated fairly,Often treated unfairly,no,Often treated unfairly,Police treat Latinos fairly,yes,conservative pole is low; flip axis at viz
+17,C247,Perceived discrimination against Latinos,A lot,None at all (DK=NA),no,None at all,Perceive little Latino discrimination,no,
+18,L300,Support immigrant-rights activism,Strongly support,Strongly oppose,yes,Strongly oppose,Oppose immigrant-rights activism,no,scale artifact (spec max=4 on 5-point item) but rank preserved
+19,L195_3,Identity rank: American,Rank 1 (most important),Rank 3 (least important),no,American ranked least important,American identity primary,yes,conservative pole is low; flip axis at viz
+20,L232,Concern about excessive police force on Latinos,Worried a lot,Not at all worried,no,Not at all worried,Not concerned about police force on Latinos,no,

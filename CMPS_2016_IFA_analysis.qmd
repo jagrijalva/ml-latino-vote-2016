@@ -1,0 +1,1225 @@
+---
+title: "Inferential Feature Analysis: Latino Trump Support (CMPS 2016)"
+subtitle: "Analysis Pipeline — Random Forest + SHAP + Bootstrap"
+author: "J. Grijalva"
+date: today
+format:
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fontsize: 11pt
+    geometry: margin=1in
+    fig-pos: "H"
+    keep-tex: false
+execute:
+  echo: false
+  message: false
+  warning: false
+  cache: false
+editor: source
+params:
+  fast_dev: false    # PRODUCTION RENDER: 500 bootstraps, 500 trees, 5 resample splits.
+  n_trees: 500       # DEV: 100 trees. PRODUCTION: 500.
+  n_boot: 500        # When fast_dev=true this is overridden to 10.
+  prop_test: 0.25
+  raw_data_file: "38040-0001-Data.rda"
+---
+
+```{r}
+#| label: setup
+
+required_pkgs <- c(
+  "tidyverse", "ranger", "treeshap", "shapviz", "missRanger",
+  "fastDummies", "caret", "pROC", "glmnet", "xgboost",
+  "ggcorrplot", "knitr", "kableExtra", "sessioninfo"
+)
+
+missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+
+  stop(
+    "Missing required packages: ", paste(missing_pkgs, collapse = ", "),
+    "\nInstall them before rendering.",
+    call. = FALSE
+  )
+}
+
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+options(width = 120)
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  cache   = FALSE,
+  dpi     = 300,
+  fig.align = "center"
+)
+```
+
+```{r}
+#| label: constants
+
+FAST_DEV   <- isTRUE(params$fast_dev)
+N_TREES    <- as.integer(params$n_trees)
+N_BOOT     <- if (FAST_DEV) 10L else as.integer(params$n_boot)
+PROP_TEST  <- as.numeric(params$prop_test)
+WEIGHT_VAR <- "WEIGHT"
+
+# Decision rule: feature j is a finding if ci_lo(j) > 0 AND sigma_j <= SIGMA_THRESHOLD
+# Pre-specified before examining results. Reported alongside all findings.
+SIGMA_THRESHOLD <- 3.0
+
+# Reproducibility seeds — fixed, never change
+SEED_SPLIT    <- 2016L
+SEED_IMPUTE   <- 2017L
+SEED_RF_T1    <- 2018L
+SEED_RF_T2    <- 2019L
+SEED_RF_T3    <- 2020L
+SEED_RF_MEN   <- 2021L
+SEED_RF_WOMEN <- 2022L
+SEED_BOOT     <- 2023L
+
+# Locate raw data
+PROJECT_ROOT <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+RAW_DATA_CANDIDATES <- unique(c(
+  params$raw_data_file,
+  file.path(PROJECT_ROOT, "data", "raw", "38040-0001-Data.rda"),
+  file.path(PROJECT_ROOT, "data", "38040-0001-Data.rda"),
+  file.path(PROJECT_ROOT, "38040-0001-Data.rda"),
+  file.path(PROJECT_ROOT, "data", "raw", "ICPSR_38040", "DS0001", "38040-0001-Data.rda")
+))
+RAW_DATA_CANDIDATES <- RAW_DATA_CANDIDATES[nzchar(RAW_DATA_CANDIDATES)]
+RAW_DATA_FILE <- RAW_DATA_CANDIDATES[file.exists(RAW_DATA_CANDIDATES)][1]
+if (is.na(RAW_DATA_FILE)) {
+  stop("Raw data file not found. Searched:\n",
+       paste0("- ", RAW_DATA_CANDIDATES, collapse = "\n"), call. = FALSE)
+}
+```
+
+```{r}
+#| label: helpers
+
+# --- Weight rescaling ---
+rescale_w <- function(w) {
+  w <- as.numeric(w)
+  w[!is.finite(w)] <- NA_real_
+  if (all(is.na(w))) stop("Weight vector is entirely missing.", call. = FALSE)
+  w[is.na(w)] <- median(w, na.rm = TRUE)
+  w / mean(w)
+}
+
+# --- Expand column names matching stems ---
+expand_drop <- function(cols, stems) {
+  unique(unlist(lapply(stems, function(s) {
+    grep(paste0("^", s, "(_|$)"), cols, value = TRUE)
+  })))
+}
+
+# --- Feature labels (hardcoded from CMPS 2016 codebook) ---
+feature_labels <- c(
+  "C15"     = "House candidate support",
+  "C31"     = "Ideology: liberal to conservative",
+  "C38"     = "Preferred policy for undocumented immigrants",
+  "C40"     = "Ban gay marriage by constitutional amendment",
+  "C41"     = "Immigration hurts state economy",
+  "C42"     = "Federal action on climate change",
+  "C44"     = "Require photo ID to vote",
+  "C45"     = "Improve Obamacare, not repeal",
+  "C111"    = "During 2016 election season felt afraid",
+  "C112"    = "During 2016 election season felt angry",
+  "C114"    = "During 2016 election season felt proud",
+  "C115"    = "During 2016 election season felt sad",
+  "C141"    = "Pathway to citizenship vs deportation",
+  "C142"    = "Reaction to immigrant-rights flag displays",
+  "C158"    = "Government apology for slavery",
+  "C228"    = "Black Lives Matter support",
+  "BL174"   = "Perceived arrest risk for people like me",
+  "BL229"   = "Black Lives Matter effectiveness",
+  "BLA191"  = "What happens to minorities affects your life",
+  "BLA205"  = "Immigrants who break the law should leave",
+  "BLA206"  = "Racial profiling is sometimes necessary",
+  "BLA207"  = "Immigrants take jobs, housing, health care",
+  "BLA208"  = "Refugees should receive more government assistance",
+  "C244"    = "Perceived discrimination against Blacks",
+  "C246"    = "Perceived discrimination against immigrants",
+  "C247"    = "Perceived discrimination against Latinos",
+  "C248"    = "Perceived discrimination against gays/lesbians",
+  "C249"    = "Perceived discrimination against Muslims",
+  "C337"    = "Federal spending on border security",
+  "L46"     = "Party better on immigration policy",
+  "L195_3"  = "Identity-importance rank: American",
+  "L231"    = "Local police treatment of Latinos",
+  "L232"    = "Concern about police force on Latinos",
+  "L241"    = "Gay/lesbian/bisexual rights activism",
+  "L266"    = "Party speaks for Latinos / disadvantaged groups",
+  "L267"    = "Party speaks for American / Christian values",
+  "L268"    = "How serious discrimination against Latinos is",
+  "L290"    = "Police more likely to use deadly force against Blacks",
+  "L293"    = "Favorability toward the Democratic Party",
+  "L294"    = "Favorability toward the Republican Party",
+  "L300"    = "Support for immigrant-rights activism",
+  "L301"    = "Anti-immigrant sentiments are anti-Latino",
+  "LA203"   = "Mother's partisan affiliation",
+  "LA204"   = "Father's partisan affiliation",
+  "LA250"   = "Discrimination against own national-origin subgroup",
+  "C242_HID" = "Most-liked aspect of party (derived open-end)",
+  "L366"    = "Worry about detention or deportation",
+  "L368"    = "Agreement with Pena Nieto hosting Trump",
+  "L21"     = "Motivated to vote by Latino solidarity"
+)
+
+label_feature <- function(x) {
+  ifelse(x %in% names(feature_labels), feature_labels[x], x)
+}
+
+# --- LaTeX table helper ---
+latex_tbl <- function(df, caption = NULL, font_size = 9, scale_down = FALSE) {
+  out <- knitr::kable(df, format = "latex", booktabs = TRUE, linesep = "",
+                       caption = caption)
+  opts <- if (scale_down) c("scale_down", "hold_position") else c("hold_position")
+  kableExtra::kable_styling(out, font_size = font_size, latex_options = opts)
+}
+
+# --- Model fitting ---
+fit_rf <- function(x, y, seed, survey_w = NULL) {
+  x <- as.data.frame(lapply(x, as.numeric))
+  y_fac <- factor(y, levels = c(0, 1))
+  n0 <- sum(y == 0); n1 <- sum(y == 1); n <- n0 + n1
+  class_w <- c("0" = n / (2 * n0), "1" = n / (2 * n1))
+  if (is.null(survey_w)) survey_w <- rep(1, length(y))
+  survey_w <- rescale_w(survey_w)
+  set.seed(seed)
+  ranger::ranger(
+    x = x, y = y_fac,
+    num.trees    = N_TREES,
+    mtry         = floor(sqrt(ncol(x))),
+    min.node.size = 5L,
+    case.weights = survey_w,
+    class.weights = class_w,
+    probability  = TRUE,
+    importance   = "impurity",
+    seed         = seed
+  )
+}
+
+predict_prob <- function(model, newdata) {
+  predict(model, data = as.data.frame(lapply(newdata, as.numeric)))$predictions[, "1"]
+}
+
+get_auc <- function(model, x_te, y_te) {
+  pred <- predict_prob(model, x_te)
+  as.numeric(pROC::auc(pROC::roc(y_te, pred, quiet = TRUE)))
+}
+
+# --- Weighted mean absolute SHAP (with explicit matrix coercion) ---
+wmean_abs_shap <- function(shap_mat, w) {
+  shap_mat <- as.matrix(shap_mat)
+  apply(abs(shap_mat), 2, function(col) weighted.mean(col, w = w))
+}
+
+# --- SHAP computation ---
+# Harmonized with 2024 reference implementation: unifier is built on the
+# training frame (the distribution the forest was fit on), then TreeSHAP is
+# applied to the test frame. Correcting the prior test-frame-unify pattern.
+compute_shap <- function(rf_model, x_tr, x_te) {
+  x_tr_num <- as.data.frame(lapply(x_tr, as.numeric))
+  x_te_num <- as.data.frame(lapply(x_te, as.numeric))
+  if (sum(is.na(x_tr_num)) > 0) x_tr_num[is.na(x_tr_num)] <- 0
+  if (sum(is.na(x_te_num)) > 0) x_te_num[is.na(x_te_num)] <- 0
+  unified <- treeshap::ranger.unify(rf_model, x_tr_num)
+  ts      <- treeshap::treeshap(unified, x_te_num)
+  shapviz::shapviz(ts)
+}
+```
+
+# Analysis Parameters
+
+```{r}
+#| label: tbl-params
+#| tbl-cap: "Analysis Configuration."
+
+tibble(
+  Parameter = c("Bootstrap iterations (B)", "Trees per forest",
+                "Test proportion", "Rank stability threshold (k)",
+                "Development mode", "Raw data file"),
+  Value = c(N_BOOT, N_TREES, PROP_TEST, SIGMA_THRESHOLD,
+            FAST_DEV, basename(RAW_DATA_FILE))
+) |>
+  latex_tbl(font_size = 9)
+```
+
+# Data and Sample Construction
+
+```{r}
+#| label: data-load
+#| include: false
+
+e <- new.env(parent = emptyenv())
+load(RAW_DATA_FILE, envir = e)
+nms <- ls(e, all.names = TRUE)
+if ("da38040.0001" %in% nms) {
+  cmps_raw <- get("da38040.0001", envir = e)
+} else {
+  dfs <- nms[vapply(nms, function(x) is.data.frame(get(x, envir = e)), logical(1))]
+  cmps_raw <- get(dfs[1], envir = e)
+}
+rm(e)
+
+cmps_latino <- cmps_raw |>
+  mutate(.row_id = seq_len(n())) |>
+  filter(as.character(ETHNIC_QUOTA) == "(2) Hispanic or Latino") |>
+  mutate(
+    trump_vote = case_when(
+      as.character(C14) == "(2) Donald Trump" ~ 1L,
+      is.na(C14)                               ~ NA_integer_,
+      TRUE                                     ~ 0L
+    )
+  ) |>
+  filter(!is.na(trump_vote))
+
+# --- CRITICAL: Fix gender labels from raw data BEFORE any preprocessing ---
+# Gender membership is a fixed sample property, never derived from imputed features.
+gender_raw <- as.character(cmps_latino$S3)
+cmps_latino$.is_male   <- as.integer(gender_raw == "(2) Male")
+cmps_latino$.is_female <- as.integer(gender_raw == "(1) Female")
+
+weights_full <- cmps_latino[[WEIGHT_VAR]]
+stopifnot(nrow(cmps_latino) > 0, sum(cmps_latino$trump_vote) > 0, !anyNA(weights_full))
+```
+
+```{r}
+#| label: tbl-sample
+#| tbl-cap: "Latino Subsample Summary."
+
+tibble(
+  Item  = c("Latino N", "Trump voters", "Trump %", "Weight range"),
+  Value = c(nrow(cmps_latino), sum(cmps_latino$trump_vote),
+            paste0(round(mean(cmps_latino$trump_vote) * 100, 1), "%"),
+            paste0("[", round(min(weights_full), 2), ", ", round(max(weights_full), 2), "]"))
+) |>
+  latex_tbl(font_size = 9)
+```
+
+# Preprocessing
+
+```{r}
+#| label: preprocess
+#| include: false
+
+sweep_na <- function(df) {
+  dk_regex  <- paste(c("don.t know", "\\bdk\\b", "refused", "not applicable",
+                        "\\bn/a\\b", "not sure", "^\\s*$"), collapse = "|")
+  sentinels <- c(88, 99, 999, 9999)
+  df |>
+    mutate(across(where(is.factor), ~ {
+      levels(.) <- iconv(levels(.), to = "UTF-8", sub = "")
+      levels(.)[stringr::str_detect(stringr::str_to_lower(levels(.)), dk_regex)] <- NA
+      .
+    })) |>
+    mutate(across(where(is.numeric), ~ ifelse(. %in% sentinels, NA_real_, .)))
+}
+
+recode_dir <- function(df, var, max_val) {
+  if (var %in% names(df)) df[[var]] <- (max_val + 1) - as.numeric(df[[var]])
+  df
+}
+
+recode_specs <- list(
+  list("C228", 5), list("C45", 5), list("C142", 4), list("C141", 4),
+  list("C41", 5), list("BLA207", 5), list("L21", 4), list("L241", 4),
+  list("BLA206", 4), list("C244", 4), list("C246", 4), list("C248", 4),
+  # v3 fix: C112 and C115 are 4-point scales (All the time / Often /
+  # Sometimes / Never), not 5-point. Previous max=5 shifted range to [2,5].
+  list("C112", 4), list("C115", 4), list("C38", 4), list("L366", 4),
+  list("L300", 4), list("C42", 5)
+)
+
+# Keep .is_male and .is_female safe — they are NOT features
+admin_cols <- intersect(
+  c(".row_id", "RESPID", "ETHNIC_QUOTA", "C14", WEIGHT_VAR, "NAT_WEIGHT",
+    ".is_male", ".is_female"),
+  names(cmps_latino)
+)
+
+dat <- sweep_na(cmps_latino)
+for (s in recode_specs) dat <- recode_dir(dat, s[[1]], s[[2]])
+
+features <- dat |>
+  select(-all_of(admin_cols), -trump_vote)
+
+# Convert S3 to numeric dummies (as a feature), but gender LABELS are already fixed above
+if ("S3" %in% names(features)) {
+  features <- features |>
+    mutate(
+      male       = as.integer(as.character(S3) == "(2) Male"),
+      male_other = as.integer(as.character(S3) == "(3) Other")
+    ) |>
+    select(-S3)
+}
+
+# Region dummies from S4
+ne_states <- c("CT","ME","MA","NH","RI","VT","NJ","NY","PA")
+mw_states <- c("IL","IN","MI","OH","WI","IA","KS","MN","MO","NE","ND","SD")
+so_states <- c("DE","FL","GA","MD","NC","SC","VA","WV","AL","KY","MS","TN","AR","LA","OK","TX","DC")
+
+if ("S4" %in% names(features)) {
+  features <- features |>
+    mutate(
+      census_region = case_when(
+        as.character(S4) %in% ne_states ~ "Northeast",
+        as.character(S4) %in% mw_states ~ "Midwest",
+        as.character(S4) %in% so_states ~ "South",
+        TRUE ~ "West"
+      )
+    ) |>
+    select(-S4)
+}
+
+# Remaining character columns → dummies
+char_cols <- names(features)[sapply(features, is.character)]
+if (length(char_cols) > 0) {
+  for (col in char_cols) {
+    tab <- table(features[[col]], useNA = "no")
+    rare <- names(tab)[tab / sum(tab) < 0.05]
+    if (length(rare) > 0) features[[col]][features[[col]] %in% rare] <- "Other"
+  }
+  features <- fastDummies::dummy_cols(
+    features, select_columns = char_cols,
+    remove_selected_columns = TRUE, remove_first_dummy = FALSE
+  )
+}
+
+# All to numeric
+features <- features |> mutate(across(where(is.factor), as.numeric))
+features <- as.data.frame(lapply(features, as.numeric))
+
+message("Preprocessing complete: ", ncol(features), " features, ", nrow(features), " observations.")
+```
+
+```{r}
+#| label: exclusions
+#| include: false
+
+# Progressive exclusion lists defined as stems. Expanded into actual column
+# names inside the tiers chunk via expand_drop(). Named and structured to
+# match the CMPS 2020 and 2024 pipelines so the three years share architecture.
+
+# Tier 2: outcome-proximate batteries (the presidential-vote block C2-C13)
+exclude_tautological <- c(
+  "C2", "C3", "C4", "C5", "C6", "C7",
+  "C8", "C9", "C10", "C11", "C12", "C13",
+  # Top-20 audit addition (2026-04-22, parallel to 2024 Q174 second-pass):
+  # L368 asks respondent's agreement with Peña Nieto's September 2016
+  # decision to host Trump for a meeting and press conference. The item's
+  # salience is Trump-specific (the item would not have been asked of any
+  # other US politician's equivalent meeting); agreeing with "hosting
+  # Trump" is a structural twin of the 2024 Q174 Trump-specific action
+  # approval item and belongs under the same tautological exclusion.
+  "L368"
+)
+
+# Tier 3 (Ring 1): partisan alignment items beyond tautological
+exclude_partisan <- c(
+  "C15", "C25", "C26", "C27", "C31",
+  "L28R", "L28D", "L29", "L30R", "L30D",
+  "L46", "L266", "L267", "L293", "L294",
+  "LA203", "LA204", "C242_HID"
+)
+```
+
+# Train/Test Split and Imputation
+
+```{r}
+#| label: split-impute
+#| include: false
+
+set.seed(SEED_SPLIT)
+train_idx <- caret::createDataPartition(cmps_latino$trump_vote, p = 1 - PROP_TEST, list = FALSE)[, 1]
+
+x_train <- features[train_idx, , drop = FALSE]
+x_test  <- features[-train_idx, , drop = FALSE]
+y_train <- cmps_latino$trump_vote[train_idx]
+y_test  <- cmps_latino$trump_vote[-train_idx]
+w_train <- rescale_w(weights_full[train_idx])
+w_test  <- rescale_w(weights_full[-train_idx])
+
+# Carry gender labels through the split (fixed metadata, not features)
+is_male_train   <- cmps_latino$.is_male[train_idx]
+is_female_train <- cmps_latino$.is_female[train_idx]
+is_male_test    <- cmps_latino$.is_male[-train_idx]
+is_female_test  <- cmps_latino$.is_female[-train_idx]
+
+# Drop all-NA and near-zero-variance columns
+all_na_cols <- names(x_train)[colSums(is.na(x_train)) == nrow(x_train)]
+nzv_cols    <- names(x_train)[sapply(x_train, function(v) length(unique(v[!is.na(v)])) <= 1)]
+drop_cols   <- unique(c(all_na_cols, nzv_cols))
+if (length(drop_cols) > 0) {
+  x_train <- x_train[, !names(x_train) %in% drop_cols, drop = FALSE]
+  x_test  <- x_test[, !names(x_test) %in% drop_cols, drop = FALSE]
+}
+x_test <- x_test[, names(x_train), drop = FALSE]
+
+na_before_train <- sum(is.na(x_train))
+na_before_test  <- sum(is.na(x_test))
+
+# Impute train and test independently (missRanger, pmm.k=3)
+set.seed(SEED_IMPUTE)
+x_train_imp <- missRanger::missRanger(x_train, num.trees = 100L, verbose = 0, pmm.k = 3L)
+set.seed(SEED_IMPUTE + 1L)
+x_test_imp  <- missRanger::missRanger(x_test, num.trees = 100L, verbose = 0, pmm.k = 3L)
+
+# Post-imputation cleanup
+clean_matrix <- function(df) {
+  as.data.frame(lapply(df, function(v) {
+    v[is.infinite(v) | is.nan(v)] <- NA
+    if (anyNA(v)) {
+      m <- median(v, na.rm = TRUE)
+      v[is.na(v)] <- if (is.finite(m)) m else 0
+    }
+    as.numeric(v)
+  }))
+}
+x_train_imp <- clean_matrix(x_train_imp)
+x_test_imp  <- clean_matrix(x_test_imp)
+
+message("Split complete: ", nrow(x_train_imp), " train / ", nrow(x_test_imp), " test, ",
+        ncol(x_train_imp), " features.")
+```
+
+```{r}
+#| label: tbl-split
+#| tbl-cap: "Train/Test Split Summary."
+
+tibble(
+  Set      = c("Training", "Test"),
+  N        = c(nrow(x_train_imp), nrow(x_test_imp)),
+  `Trump %` = round(c(mean(y_train), mean(y_test)) * 100, 1),
+  Features = c(ncol(x_train_imp), ncol(x_test_imp))
+) |>
+  latex_tbl(font_size = 9)
+```
+
+# Tier Construction and Partisan Leakage Audit
+
+```{r}
+#| label: tiers
+#| include: false
+
+all_cols <- names(x_train_imp)
+
+# Expand stems into actual column names present in this split's feature matrix
+t2_drop    <- expand_drop(all_cols, exclude_tautological)
+ring1_drop <- expand_drop(all_cols, exclude_partisan)
+t3_drop    <- union(t2_drop, ring1_drop)
+
+t2_cols <- setdiff(all_cols, t2_drop)
+t3_cols <- setdiff(all_cols, t3_drop)
+
+# Leakage audit: verify no partisan variables remain in T3
+partisan_guard_stems <- unique(c(exclude_partisan, "C14"))
+partisan_leakage <- expand_drop(t3_cols, partisan_guard_stems)
+if (length(partisan_leakage) > 0) {
+  stop("Ring 1 leakage audit FAILED. Leaked variables: ",
+       paste(partisan_leakage, collapse = ", "), call. = FALSE)
+}
+
+# Build tier datasets
+train_t1 <- x_train_imp
+train_t2 <- x_train_imp[, t2_cols, drop = FALSE]
+train_t3 <- x_train_imp[, t3_cols, drop = FALSE]
+test_t1  <- x_test_imp
+test_t2  <- x_test_imp[, t2_cols, drop = FALSE]
+test_t3  <- x_test_imp[, t3_cols, drop = FALSE]
+
+# Gender subgroup label vectors are retained in the save bundle so that the
+# separate subgroup QMD can reconstruct slices without refitting the main pipeline.
+# All subgroup modelling is handled in CMPS_2016_IFA_gender_subgroups.qmd.
+
+message("Tiers: T1=", ncol(train_t1), " T2=", ncol(train_t2), " T3=", ncol(train_t3))
+```
+
+```{r}
+#| label: tbl-tiers
+#| tbl-cap: "Progressive Exclusion Tiers."
+
+tibble(
+  Tier     = c("1: Full", "2: Non-Tautological", "3: Non-Partisan (Ring 1)"),
+  `Train N` = c(nrow(train_t1), nrow(train_t2), nrow(train_t3)),
+  `Test N`  = c(nrow(test_t1), nrow(test_t2), nrow(test_t3)),
+  Features = c(ncol(train_t1), ncol(train_t2), ncol(train_t3)),
+  Excluded = c(0, length(t2_drop), length(t3_drop))
+) |>
+  latex_tbl(font_size = 9, scale_down = TRUE)
+```
+
+# Model Fitting
+
+```{r}
+#| label: models
+#| include: false
+
+message("Fitting Tier 1 model...")
+rf_t1    <- fit_rf(train_t1, y_train, SEED_RF_T1, survey_w = w_train)
+message("Fitting Tier 2 model...")
+rf_t2    <- fit_rf(train_t2, y_train, SEED_RF_T2, survey_w = w_train)
+message("Fitting Tier 3 model...")
+rf_t3    <- fit_rf(train_t3, y_train, SEED_RF_T3, survey_w = w_train)
+
+auc_t1 <- get_auc(rf_t1, test_t1, y_test)
+auc_t2 <- get_auc(rf_t2, test_t2, y_test)
+auc_t3 <- get_auc(rf_t3, test_t3, y_test)
+
+message("AUC: T1=", round(auc_t1, 3), " T2=", round(auc_t2, 3),
+        " T3=", round(auc_t3, 3))
+```
+
+# Benchmark Models
+
+Elastic net logistic regression and XGBoost are fitted on the same Tier 3 train/test split to confirm that findings are a property of the data rather than an artifact of Random Forest.
+
+```{r}
+#| label: benchmarks
+#| include: false
+
+# --- Elastic Net Logistic Regression ---
+message("Fitting elastic net benchmark...")
+x_train_mat <- as.matrix(train_t3)
+x_test_mat  <- as.matrix(test_t3)
+
+# Inverse-frequency weights for glmnet (same logic as RF)
+n0 <- sum(y_train == 0); n1 <- sum(y_train == 1); n_total <- n0 + n1
+glm_weights <- ifelse(y_train == 1, n_total / (2 * n1), n_total / (2 * n0))
+glm_weights <- glm_weights * w_train  # combine class weights with survey weights
+
+set.seed(SEED_RF_T3)
+cv_enet <- glmnet::cv.glmnet(
+  x = x_train_mat, y = y_train,
+  family   = "binomial",
+  alpha    = 0.5,  # elastic net (midpoint between ridge and lasso)
+  weights  = glm_weights,
+  nfolds   = 5,
+  type.measure = "auc"
+)
+
+pred_enet <- predict(cv_enet, newx = x_test_mat, s = "lambda.min", type = "response")[, 1]
+auc_enet  <- as.numeric(pROC::auc(pROC::roc(y_test, pred_enet, quiet = TRUE)))
+
+# --- XGBoost ---
+message("Fitting XGBoost benchmark...")
+scale_pos <- n0 / n1  # XGBoost scale_pos_weight parameter
+
+set.seed(SEED_RF_T3)
+xgb_train <- xgboost::xgb.DMatrix(
+  data = x_train_mat, label = y_train, weight = w_train
+)
+xgb_test <- xgboost::xgb.DMatrix(
+  data = x_test_mat, label = y_test
+)
+
+xgb_model <- xgboost::xgb.train(
+  params = list(
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    max_depth        = 6,
+    eta              = 0.1,
+    subsample        = 0.8,
+    colsample_bytree = 0.8,
+    scale_pos_weight = scale_pos
+  ),
+  data       = xgb_train,
+  nrounds    = 300,
+  verbose    = 0
+)
+
+pred_xgb <- predict(xgb_model, xgb_test)
+auc_xgb  <- as.numeric(pROC::auc(pROC::roc(y_test, pred_xgb, quiet = TRUE)))
+
+message("Benchmark AUCs: Elastic Net=", round(auc_enet, 3),
+        " XGBoost=", round(auc_xgb, 3),
+        " Random Forest=", round(auc_t3, 3))
+```
+
+```{r}
+#| label: tbl-benchmarks
+#| tbl-cap: "Tier 3 AUC Across Learners."
+
+tibble(
+  Learner    = c("Random Forest", "Elastic Net Logistic", "XGBoost"),
+  `Test AUC` = round(c(auc_t3, auc_enet, auc_xgb), 3)
+) |>
+  latex_tbl(font_size = 9)
+```
+
+# SHAP Computation
+
+```{r}
+#| label: shap
+#| include: false
+
+# Tier 3 (primary reported model)
+message("Computing SHAP values for Tier 3...")
+sv_t3 <- compute_shap(rf_t3, train_t3, test_t3)
+imp_t3 <- wmean_abs_shap(sv_t3$S, w_test)
+
+# Tier 1 and Tier 2 SHAP also computed and persisted so the reporting
+# QMD can produce parallel beeswarms / top-20s across the exclusion
+# hierarchy without having to re-render this file.
+message("Computing SHAP values for Tier 1...")
+sv_t1 <- compute_shap(rf_t1, train_t1, test_t1)
+imp_t1 <- wmean_abs_shap(sv_t1$S, w_test)
+
+message("Computing SHAP values for Tier 2...")
+sv_t2 <- compute_shap(rf_t2, train_t2, test_t2)
+imp_t2 <- wmean_abs_shap(sv_t2$S, w_test)
+```
+
+# Feature Correlation Structure
+
+When features are correlated, SHAP distributes predictive credit across correlated items in ways that are mathematically principled but may not map onto standalone constructs. The correlation matrix below documents the pairwise relationships among the top features.
+
+```{r}
+#| label: fig-corr
+#| fig-width: 9
+#| fig-height: 8
+#| fig-cap: "Pairwise Pearson correlations among top 20 Tier 3 features (test set)."
+
+top20_names <- names(sort(imp_t3, decreasing = TRUE))[1:20]
+top20_data  <- test_t3[, top20_names, drop = FALSE]
+top20_labels <- label_feature(top20_names)
+names(top20_data) <- stringr::str_trunc(top20_labels, 35)
+
+cor_mat <- cor(top20_data, use = "pairwise.complete.obs")
+
+ggcorrplot::ggcorrplot(
+  cor_mat,
+  type     = "lower",
+  lab      = TRUE,
+  lab_size = 2.5,
+  tl.cex   = 8,
+  colors   = c("#B22222", "white", "#1D3557"),
+  title    = "Correlation Structure: Top 20 Non-Partisan Features"
+) +
+  theme(plot.title = element_text(size = 12))
+```
+
+# Bootstrap Confidence Intervals
+
+The bootstrap resamples the training set `r N_BOOT` times, refitting a Random Forest and computing TreeSHAP on the fixed test set each time. This isolates model instability from evaluation-set composition variance. Each feature's 95% CI is the 2.5th--97.5th percentile of the bootstrap distribution of $E_w[|\phi_j|]$.
+
+```{r}
+#| label: boot-t3
+#| include: false
+
+run_bootstrap <- function(train_d, test_d, y_tr, y_te, w_tr, w_te,
+                          seed_base, label = "T3") {
+  p <- ncol(train_d); n <- nrow(train_d)
+  b_imp  <- matrix(NA_real_, nrow = N_BOOT, ncol = p, dimnames = list(NULL, names(train_d)))
+  b_rank <- matrix(NA_real_, nrow = N_BOOT, ncol = p, dimnames = list(NULL, names(train_d)))
+  b_auc  <- rep(NA_real_, N_BOOT)
+  x_te_num <- as.data.frame(lapply(test_d, as.numeric))
+  # NA safety net (v3): replace surviving NAs with 0
+  if (sum(is.na(x_te_num)) > 0) {
+    x_te_num[is.na(x_te_num)] <- 0
+  }
+  failed <- integer(0)
+
+  for (i in seq_len(N_BOOT)) {
+    result <- tryCatch({
+      set.seed(seed_base + i)
+      idx  <- sample.int(n, size = n, replace = TRUE)
+      xb_num <- as.data.frame(lapply(train_d[idx, , drop = FALSE], as.numeric))
+      if (sum(is.na(xb_num)) > 0) xb_num[is.na(xb_num)] <- 0
+      rf_b <- fit_rf(train_d[idx, , drop = FALSE], y_tr[idx],
+                      seed = seed_base + i, survey_w = w_tr[idx])
+      auc_b <- get_auc(rf_b, test_d, y_te)
+      unified <- treeshap::ranger.unify(rf_b, xb_num)
+      ts_b    <- treeshap::treeshap(unified, x_te_num)
+      imp_b   <- wmean_abs_shap(ts_b$shaps, w_te)
+      list(auc = auc_b, imp = imp_b)
+    }, error = function(e) {
+      message("[", label, "] Bootstrap iteration ", i, " failed: ", conditionMessage(e))
+      NULL
+    })
+
+    if (is.null(result)) {
+      failed <- c(failed, i)
+      next
+    }
+
+    b_auc[i]   <- result$auc
+    b_imp[i, ] <- result$imp
+    b_rank[i, ] <- rank(-result$imp, ties.method = "average")
+
+    if (i %% 25 == 0 || i == N_BOOT) {
+      message("[", label, "] Completed iteration ", i, " / ", N_BOOT)
+    }
+  }
+
+  # Drop failed rows
+  good <- !is.na(b_auc)
+  if (sum(good) < 10) stop("[", label, "] Fewer than 10 successful bootstrap iterations.", call. = FALSE)
+  if (length(failed) > 0) message("[", label, "] ", length(failed), " iterations failed and were dropped.")
+
+  list(imp = b_imp[good, , drop = FALSE],
+       rank = b_rank[good, , drop = FALSE],
+       auc = b_auc[good],
+       n_success = sum(good),
+       n_failed = length(failed))
+}
+
+message("=== Bootstrap: Tier 3 ===")
+boot_t3 <- run_bootstrap(train_t3, test_t3, y_train, y_test, w_train, w_test,
+                          SEED_BOOT, label = "T3")
+
+# Tier 1 and Tier 2 bootstraps (harmonized with 2024 reference: the reporting
+# QMD and cross-year panel view need ci_lo / sigma_j / finding flags at every
+# tier without re-rendering. Seeds are offset so the three runs are
+# independent. Expected wall-time: ~3x the Tier 3 boot alone.
+message("=== Bootstrap: Tier 1 ===")
+boot_t1 <- run_bootstrap(train_t1, test_t1, y_train, y_test, w_train, w_test,
+                          SEED_BOOT + 1000L, label = "T1")
+
+message("=== Bootstrap: Tier 2 ===")
+boot_t2 <- run_bootstrap(train_t2, test_t2, y_train, y_test, w_train, w_test,
+                          SEED_BOOT + 2000L, label = "T2")
+```
+
+# Results Assembly
+
+```{r}
+#| label: results
+#| include: false
+
+build_results <- function(point_imp, boot_obj, sigma_k = SIGMA_THRESHOLD) {
+  out <- tibble(
+    feature   = names(point_imp),
+    label     = label_feature(names(point_imp)),
+    E_w_phi   = unname(point_imp),
+    rank      = rank(-unname(point_imp), ties.method = "average")
+  ) |> arrange(rank)
+
+  if (!is.null(boot_obj)) {
+    bm <- boot_obj$imp
+    br <- boot_obj$rank
+    out <- out |> mutate(
+      ci_lo     = apply(bm, 2, quantile, probs = 0.025, na.rm = TRUE)[feature],
+      ci_hi     = apply(bm, 2, quantile, probs = 0.975, na.rm = TRUE)[feature],
+      sigma_j   = apply(br, 2, sd, na.rm = TRUE)[feature],
+      # Conjunctive decision rule: magnitude bounded away from zero AND rank stable
+      finding   = (ci_lo > 0) & (sigma_j <= sigma_k)
+    )
+  }
+  out
+}
+
+results_t3 <- build_results(imp_t3, boot_t3)
+results_t1 <- build_results(imp_t1, boot_t1)
+results_t2 <- build_results(imp_t2, boot_t2)
+
+# Tier 3 test-set predicted probabilities (persisted so reporting QMD can
+# reconstruct ROC curves / calibration plots without refitting).
+pred_t3 <- predict_prob(rf_t3, test_t3)
+
+# Assembled AUC summary tibble (persisted in bundle; mirrors the inline
+# tbl-auc table so downstream code has a canonical version to read).
+auc_summary_final <- tibble(
+  Model = c("Tier 1 (Full)", "Tier 2 (Non-Tautological)", "Tier 3 (Non-Partisan)"),
+  `Test AUC` = round(c(auc_t1, auc_t2, auc_t3), 3),
+  `Drop from T1` = c(NA, round(auc_t1 - auc_t2, 3), round(auc_t1 - auc_t3, 3)),
+  `Boot Mean AUC` = c(NA, NA, round(mean(boot_t3$auc), 3)),
+  `95% CI` = c(
+    "—", "—",
+    paste0("[", round(quantile(boot_t3$auc, 0.025), 3), ", ",
+           round(quantile(boot_t3$auc, 0.975), 3), "]")
+  )
+)
+```
+
+# Threshold Sensitivity
+
+The stability threshold $k$ is a pre-specified reporting rule, not a universal standard. The table below shows which features qualify as stable findings at $k = 2.0$, $k = 3.0$, and $k = 4.0$, holding the magnitude criterion ($\text{ci\_lo} > 0$) constant throughout.
+
+```{r}
+#| label: tbl-sensitivity
+#| tbl-cap: "Threshold Sensitivity: Stable Features at k = 2.0, 3.0, and 4.0."
+
+sensitivity <- results_t3 |>
+  filter(ci_lo > 0) |>
+  slice_head(n = 20) |>
+  transmute(
+    Rank    = as.integer(rank),
+    Feature = label,
+    sigma_j = round(sigma_j, 2),
+    `k=2.0` = ifelse(sigma_j <= 2.0, "\u2713", ""),
+    `k=3.0` = ifelse(sigma_j <= 3.0, "\u2713", ""),
+    `k=4.0` = ifelse(sigma_j <= 4.0, "\u2713", "")
+  )
+
+sensitivity |>
+  latex_tbl(font_size = 8, scale_down = TRUE)
+```
+
+# Repeated-Resampling Robustness
+
+The bootstrap assesses training-sample sensitivity conditional on one fixed test partition. To confirm the feature architecture is not an artifact of the particular split, five independent 75/25 partitions are drawn and the full Tier 3 RF + SHAP pipeline is run on each. Spearman rank correlations of feature importance across all pairs test whether the same features surface regardless of the split.
+
+```{r}
+#| label: resample-robustness
+#| include: false
+
+N_RESAMPLE_SPLITS <- if (FAST_DEV) 2L else 5L
+resample_seeds <- SEED_SPLIT + seq(100L, by = 100L, length.out = N_RESAMPLE_SPLITS)
+
+resample_imps <- list()
+
+for (s_i in seq_len(N_RESAMPLE_SPLITS)) {
+  message("=== Resampling robustness: split ", s_i, " / ", N_RESAMPLE_SPLITS, " ===")
+
+  result <- tryCatch({
+    set.seed(resample_seeds[s_i])
+    rs_idx <- caret::createDataPartition(cmps_latino$trump_vote, p = 1 - PROP_TEST, list = FALSE)[, 1]
+
+    rs_x_train <- features[rs_idx, , drop = FALSE]
+    rs_x_test  <- features[-rs_idx, , drop = FALSE]
+    rs_y_train <- cmps_latino$trump_vote[rs_idx]
+    rs_y_test  <- cmps_latino$trump_vote[-rs_idx]
+    rs_w_train <- rescale_w(weights_full[rs_idx])
+    rs_w_test  <- rescale_w(weights_full[-rs_idx])
+
+    # Drop all-NA and NZV columns (same logic as main pipeline)
+    rs_na_cols  <- names(rs_x_train)[colSums(is.na(rs_x_train)) == nrow(rs_x_train)]
+    rs_nzv_cols <- names(rs_x_train)[sapply(rs_x_train, function(v) length(unique(v[!is.na(v)])) <= 1)]
+    rs_drop     <- unique(c(rs_na_cols, rs_nzv_cols))
+    if (length(rs_drop) > 0) {
+      rs_x_train <- rs_x_train[, !names(rs_x_train) %in% rs_drop, drop = FALSE]
+      rs_x_test  <- rs_x_test[, !names(rs_x_test) %in% rs_drop, drop = FALSE]
+    }
+    rs_x_test <- rs_x_test[, names(rs_x_train), drop = FALSE]
+
+    # Impute — pmm.k = 3 requires complete-case donors. Resample splits can
+    # produce subsets with no complete rows, so fall back to pmm.k = 0 if needed.
+    set.seed(SEED_IMPUTE + resample_seeds[s_i])
+    rs_x_train <- tryCatch(
+      missRanger::missRanger(rs_x_train, num.trees = 100L, verbose = 0, pmm.k = 3L),
+      error = function(e) {
+        message("  pmm.k=3 failed for train — retrying with pmm.k=0")
+        missRanger::missRanger(rs_x_train, num.trees = 100L, verbose = 0, pmm.k = 0L)
+      }
+    )
+    rs_x_test <- tryCatch(
+      missRanger::missRanger(rs_x_test, num.trees = 100L, verbose = 0, pmm.k = 3L),
+      error = function(e) {
+        message("  pmm.k=3 failed for test — retrying with pmm.k=0")
+        missRanger::missRanger(rs_x_test, num.trees = 100L, verbose = 0, pmm.k = 0L)
+      }
+    )
+    rs_x_train <- clean_matrix(rs_x_train)
+    rs_x_test  <- clean_matrix(rs_x_test)
+
+    # Apply Tier 3 exclusions using the same stem vectors as the main pipeline
+    rs_all_cols <- names(rs_x_train)
+    rs_t2_drop  <- expand_drop(rs_all_cols, exclude_tautological)
+    rs_ring1    <- expand_drop(rs_all_cols, exclude_partisan)
+    rs_t3_drop  <- union(rs_t2_drop, rs_ring1)
+    rs_t3_cols  <- setdiff(rs_all_cols, rs_t3_drop)
+
+    rs_train_t3 <- rs_x_train[, rs_t3_cols, drop = FALSE]
+    rs_test_t3  <- rs_x_test[, rs_t3_cols, drop = FALSE]
+
+    # Fit RF + SHAP
+    rs_rf <- fit_rf(rs_train_t3, rs_y_train, seed = resample_seeds[s_i], survey_w = rs_w_train)
+    rs_sv <- compute_shap(rs_rf, rs_train_t3, rs_test_t3)
+    wmean_abs_shap(rs_sv$S, rs_w_test)
+  }, error = function(e) {
+    message("  Split ", s_i, " failed entirely: ", conditionMessage(e), " — skipping")
+    NULL
+  })
+
+  resample_imps[[s_i]] <- result
+}
+
+# Drop any splits that failed (NULL entries)
+resample_imps <- Filter(Negate(is.null), resample_imps)
+if (length(resample_imps) < 2) {
+  warning("Fewer than 2 resample splits succeeded — skipping robustness analysis.")
+  min_rho  <- NA_real_
+  mean_rho <- NA_real_
+  rho_mat  <- matrix(NA_real_, 1, 1, dimnames = list("Split_1", "Split_1"))
+} else {
+
+# Compute Spearman rho across all pairs
+# Align features to common set
+common_features <- Reduce(intersect, lapply(resample_imps, names))
+imp_mat <- sapply(resample_imps, function(imp) imp[common_features])
+
+n_splits <- ncol(imp_mat)
+rho_mat <- matrix(NA_real_, n_splits, n_splits,
+                  dimnames = list(paste0("Split_", 1:n_splits), paste0("Split_", 1:n_splits)))
+for (i in 1:(n_splits - 1)) {
+  for (j in (i + 1):n_splits) {
+    rho_mat[i, j] <- cor(imp_mat[, i], imp_mat[, j], method = "spearman")
+    rho_mat[j, i] <- rho_mat[i, j]
+  }
+}
+diag(rho_mat) <- 1.0
+min_rho <- min(rho_mat[upper.tri(rho_mat)])
+mean_rho <- mean(rho_mat[upper.tri(rho_mat)])
+
+message("Resampling robustness: min rho = ", round(min_rho, 3),
+        " mean rho = ", round(mean_rho, 3))
+}
+```
+
+```{r}
+#| label: tbl-resample
+#| tbl-cap: !expr paste0("Spearman Rank Correlations Across ", N_RESAMPLE_SPLITS, " Independent Splits (min = ", round(min_rho, 3), ", mean = ", round(mean_rho, 3), ").")
+
+as.data.frame(round(rho_mat, 3)) |>
+  tibble::rownames_to_column("Split") |>
+  latex_tbl(font_size = 8, scale_down = TRUE)
+```
+
+# Main Results
+
+## Model Performance
+
+```{r}
+#| label: tbl-auc
+#| tbl-cap: "AUC Across the Progressive Exclusion Framework."
+
+auc_ci <- function(boot_auc) {
+  paste0("[", round(quantile(boot_auc, .025), 3), ", ",
+         round(quantile(boot_auc, .975), 3), "]")
+}
+
+tibble(
+  Model         = c("Tier 1 (Full)", "Tier 2 (Non-Tautological)",
+                     "Tier 3 (Non-Partisan)"),
+  `Test AUC`    = round(c(auc_t1, auc_t2, auc_t3), 3),
+  `Drop from T1` = c(NA, round(auc_t1 - auc_t2, 3), round(auc_t1 - auc_t3, 3)),
+  `Boot Mean AUC` = c(NA, NA, round(mean(boot_t3$auc), 3)),
+  `95% CI`      = c("---", "---", auc_ci(boot_t3$auc))
+) |>
+  latex_tbl(font_size = 9, scale_down = TRUE)
+```
+
+## Stable Non-Partisan Features
+
+Features are reported as stable findings under a conjunctive decision rule pre-specified before examining results: the bootstrap 95% CI lower bound for $E_w[|\phi_j|]$ must exceed zero (magnitude criterion) AND $\sigma_j \leq$ `r SIGMA_THRESHOLD` (rank stability criterion). The first condition ensures the feature's importance is bounded away from nothing across `r N_BOOT` training resamples. The second ensures its ordinal position in the importance ranking is stable enough to support comparative claims.
+
+```{r}
+#| label: tbl-stable
+#| tbl-cap: !expr paste0("Stable Ring 1 Non-Partisan Features (ci_lo > 0, sigma_j <= ", SIGMA_THRESHOLD, ").")
+
+results_t3 |>
+  filter(finding) |>
+  transmute(
+    Rank       = as.integer(rank),
+    Feature    = label,
+    Code       = feature,
+    `E_w[|phi|]` = round(E_w_phi, 5),
+    `CI lo`    = round(ci_lo, 5),
+    `CI hi`    = round(ci_hi, 5),
+    sigma_j    = round(sigma_j, 2)
+  ) |>
+  latex_tbl(font_size = 8, scale_down = TRUE)
+```
+
+## Figure 1. Feature Importance (Beeswarm)
+
+```{r}
+#| label: fig-beeswarm
+#| fig-width: 9
+#| fig-height: 8
+
+sv_t3_labeled <- sv_t3
+colnames(sv_t3_labeled$S) <- label_feature(colnames(sv_t3_labeled$S))
+colnames(sv_t3_labeled$X) <- label_feature(colnames(sv_t3_labeled$X))
+
+shapviz::sv_importance(sv_t3_labeled, kind = "beeswarm", max_display = 15L, alpha = 0.45) +
+  labs(
+    title    = "Ring 1 Non-Partisan Predictors of Latino Trump Support (2016)",
+    subtitle = paste0("Test set | N = ", nrow(test_t3), " | partisan alignment removed")
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+## Figure 2. Bootstrap Confidence Intervals
+
+```{r}
+#| label: fig-ci
+#| fig-width: 9
+#| fig-height: 7
+
+ci_data <- results_t3 |>
+  slice_head(n = 20) |>
+  mutate(
+    Feature = stringr::str_trunc(label, 48),
+    Feature = forcats::fct_reorder(Feature, -rank)
+  )
+
+ggplot(ci_data, aes(x = E_w_phi, y = Feature, color = finding)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = ci_lo, xmax = ci_hi), height = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_color_manual(
+    values = c("TRUE" = "#1D3557", "FALSE" = "grey65"),
+    labels = c("TRUE" = paste0("Stable (ci_lo > 0, \u03c3\u2c7c \u2264 ", SIGMA_THRESHOLD, ")"),
+               "FALSE" = "Does not meet both criteria"),
+    name   = NULL
+  ) +
+  labs(
+    title    = "Bootstrap CIs for Ring 1 Non-Partisan Features",
+    subtitle = paste0("Top 20 | B = ", boot_t3$n_success,
+                      " | Decision rule: ci_lo > 0 and \u03c3\u2c7c \u2264 ", SIGMA_THRESHOLD),
+    x = "Weighted mean |SHAP|", y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+```
+
+## Figure 3. SHAP Dependence (Top Feature)
+
+```{r}
+#| label: fig-dependence
+#| fig-width: 8
+#| fig-height: 5
+
+top_feature <- results_t3$feature[1]
+shapviz::sv_dependence(sv_t3, v = top_feature, alpha = 0.4) +
+  labs(
+    title = paste0("SHAP Dependence: ", label_feature(top_feature)),
+    y     = "SHAP value"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+# Save Results Bundle
+
+All model objects, SHAP matrices, bootstrap results, tier metadata, and summary tables are saved to a single `.rds` file. The reporting QMD loads this file to generate all manuscript figures and tables without re-running the model.
+
+```{r}
+#| label: save-rds
+#| include: false
+
+ifa_results <- list(
+  # --- Metadata ---
+  render_date   = Sys.Date(),
+  r_version     = R.version.string,
+  params        = list(n_boot = N_BOOT, n_trees = N_TREES,
+                        prop_test = PROP_TEST, fast_dev = FAST_DEV,
+                        sigma_threshold = SIGMA_THRESHOLD),
+  seeds         = list(split = SEED_SPLIT, impute = SEED_IMPUTE,
+                        rf_t1 = SEED_RF_T1, rf_t2 = SEED_RF_T2, rf_t3 = SEED_RF_T3,
+                        rf_men = SEED_RF_MEN, rf_women = SEED_RF_WOMEN,
+                        boot = SEED_BOOT),
+  raw_data_file = basename(RAW_DATA_FILE),
+  raw_data_md5  = unname(tools::md5sum(RAW_DATA_FILE)),
+
+  # Subgroup label vectors retained for downstream gender-subgroup QMD.
+  is_male_train   = is_male_train,
+  is_male_test    = is_male_test,
+  is_female_train = is_female_train,
+  is_female_test  = is_female_test,
+
+  # --- Sample ---
+  n_latino      = nrow(cmps_latino),
+  n_trump       = sum(cmps_latino$trump_vote),
+  train_idx     = train_idx,
+  n_train       = nrow(x_train_imp),
+  n_test        = nrow(x_test_imp),
+
+  # --- Feature info ---
+  feature_labels = feature_labels,
+  all_features   = names(x_train_imp),
+  t2_drop        = t2_drop,
+  t3_drop        = t3_drop,
+  t2_cols        = t2_cols,
+  t3_cols        = t3_cols,
+  n_features_t1  = ncol(train_t1),
+  n_features_t2  = ncol(train_t2),
+  n_features_t3  = ncol(train_t3),
+
+  # --- AUC ---
+  auc = c(t1 = auc_t1, t2 = auc_t2, t3 = auc_t3),
+
+  # --- Tier 3 feature matrices retained so the gender-subgroup QMD can
+  #     reconstruct men/women slices and refit Models 4 and 5 without
+  #     rerunning the full pipeline.
+  train_t3 = train_t3,
+  test_t3  = test_t3,
+  y_train  = y_train,
+  y_test   = y_test,
+  w_train  = w_train,
+
+  # --- Tier 3 (primary reported model) ---
+  sv_t3 = sv_t3,
+  imp_t3 = imp_t3,
+  boot_t3 = boot_t3,
+  pred_t3 = pred_t3,
+
+  # --- Tier 1 and Tier 2 SHAP, importance, bootstraps, and results tables
+  #     (harmonized with 2024 reference implementation so the reporting QMD
+  #     and cross-year panel view can reconstruct parallel beeswarms and
+  #     stable-feature sets across the exclusion hierarchy without
+  #     re-rendering this file).
+  sv_t1 = sv_t1,
+  imp_t1 = imp_t1,
+  boot_t1 = boot_t1,
+  results_t1 = results_t1,
+  sv_t2 = sv_t2,
+  imp_t2 = imp_t2,
+  boot_t2 = boot_t2,
+  results_t2 = results_t2,
+
+  # --- Exclusion lists for provenance ---
+  exclude_tautological = exclude_tautological,
+  exclude_partisan = exclude_partisan,
+
+  # --- Decision rule ---
+  sigma_threshold = SIGMA_THRESHOLD,
+
+  # --- Benchmark models ---
+  auc_enet  = auc_enet,
+  auc_xgb   = auc_xgb,
+
+  # --- Correlation structure ---
+  cor_top20 = cor_mat,
+
+  # --- Threshold sensitivity ---
+  sensitivity = sensitivity,
+
+  # --- Resampling robustness ---
+  resample_rho_mat = rho_mat,
+  resample_min_rho = min_rho,
+  resample_mean_rho = mean_rho,
+
+  # --- Assembled results tables ---
+  results_t3 = results_t3,
+
+  # --- Final AUC summary tibble (harmonized with 2024) ---
+  auc_summary_final = auc_summary_final,
+
+  # --- Weights (for reporting QMD) ---
+  w_test = w_test
+)
+
+rds_path <- file.path(PROJECT_ROOT, "ifa_results.rds")
+saveRDS(ifa_results, rds_path)
+message("Results saved to: ", rds_path, " (",
+        round(file.size(rds_path) / 1e6, 1), " MB)")
+```
+
+The results bundle has been saved to `ifa_results.rds` (`r round(file.size(file.path(PROJECT_ROOT, "ifa_results.rds")) / 1e6, 1)` MB). Load this file in the reporting QMD with `readRDS("ifa_results.rds")`.
+
+# Session Information
+
+```{r}
+#| label: session-info
+
+sessioninfo::session_info()
+```

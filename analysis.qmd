@@ -1208,13 +1208,14 @@ ifa_results <- list(
   w_test = w_test
 )
 
-rds_path <- file.path(PROJECT_ROOT, "ifa_results.rds")
+dir.create(file.path(PROJECT_ROOT, "data", "derived"), recursive = TRUE, showWarnings = FALSE)
+rds_path <- file.path(PROJECT_ROOT, "data", "derived", "ifa_results_2016.rds")
 saveRDS(ifa_results, rds_path)
 message("Results saved to: ", rds_path, " (",
         round(file.size(rds_path) / 1e6, 1), " MB)")
 ```
 
-The results bundle has been saved to `ifa_results.rds` (`r round(file.size(file.path(PROJECT_ROOT, "ifa_results.rds")) / 1e6, 1)` MB). Load this file in the reporting QMD with `readRDS("ifa_results.rds")`.
+The results bundle has been saved to `data/derived/ifa_results_2016.rds` (`r round(file.size(file.path(PROJECT_ROOT, "data", "derived", "ifa_results_2016.rds")) / 1e6, 1)` MB). The pooled paper loads this file with `readRDS("data/derived/ifa_results_2016.rds")`.
 
 # Session Information
 
